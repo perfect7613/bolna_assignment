@@ -1,10 +1,13 @@
 import asyncio
+import os
 import re
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable
 
 import aiohttp
+from aiohttp import web
 import feedparser
 
 Incident = dict
@@ -130,25 +133,45 @@ async def watch_page(
         await asyncio.sleep(page.poll_interval)
 
 
+LOG: deque[str] = deque(maxlen=200)
+
+
+def log_handler(event: Incident) -> None:
+    line = (
+        f"[{event['timestamp']}] Product: {event['page']} - {event['components']}\n"
+        f"Status: {event['title']}"
+    )
+    LOG.append(line)
+    print(line)
+
+
+async def handle_index(_request: web.Request) -> web.Response:
+    body = "\n\n".join(LOG) if LOG else "No incidents yet. Monitoring..."
+    return web.Response(text=body)
+
+
 async def monitor(
     pages: list[StatusPage] | None = None,
-    on_incident: EventHandler = default_handler,
+    on_incident: EventHandler = log_handler,
 ) -> None:
     pages = pages or PAGES
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT, limit_per_host=2)
 
-    print(f"Monitoring {len(pages)} status page(s). Press Ctrl+C to stop.\n")
+    print(f"Monitoring {len(pages)} status page(s).\n")
 
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [
-            asyncio.create_task(watch_page(session, page, semaphore, on_incident))
-            for page in pages
-        ]
-        try:
-            await asyncio.gather(*tasks)
-        except asyncio.CancelledError:
-            pass
+    session = aiohttp.ClientSession(connector=connector)
+    for page in pages:
+        asyncio.create_task(watch_page(session, page, semaphore, on_incident))
+
+    app = web.Application()
+    app.router.add_get("/", handle_index)
+    port = int(os.environ.get("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    print(f"Serving on port {port}")
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
